@@ -18,8 +18,17 @@
 /***********************
  * Private Defines
  ***********************/
-#define _RX_BUFFER_LENGTH   4096
-#define _UPDATE_MANAGER_PORT 54322
+#define _BUFFER_LENGTH   1024
+
+#define _UPDATE_MANAGER_DEFAULT__PORT 54322
+#define _UPDATE_MANAGER_DEFAULT__AUTO_RESTART true
+#define _UPDATE_MANAGER_DEFAULT__RESTART_DELAY_MS 0
+
+#define _UPDATE_MANAGER_DEFAULT_OPTIONS { \
+    .udp_port = _UPDATE_MANAGER_DEFAULT__PORT, \
+    .auto_restart = _UPDATE_MANAGER_DEFAULT__AUTO_RESTART, \
+    .restart_delay_ms = _UPDATE_MANAGER_DEFAULT__RESTART_DELAY_MS \
+}
 
 #define _UPDATE_METADATA_MARKER "UPDM"
 #define _UPDATE_DATA_MARKER "UPDD"
@@ -27,45 +36,52 @@
 #define _PARTITION1 "ota_0"
 #define _PARTITION2 "ota_1"
 
+/***********************
+ * Private Types
+ ***********************/
+/** @brief structure for an update metadata packet.  This is packed **/
+typedef struct
+{
+    uint32_t marker;            /**< Marker which helps identify this packet as an update manager metadata packet **/
+    uint32_t sequence_number;   /**< Sequence number for this packet.  For image metadata, this should always be 0 **/
+    uint32_t image_size_bytes;  /**< Image size in bytes. **/
+    uint32_t num_packets;       /**< number of packets to expect over the course of the update process **/
+    uint32_t image_checksum;    /**< checksum of the entire image **/
+}__attribute__((packed)) update_metadata_t;
+
+/** @brief structure for an update data packet.  Contains new image binary data.  This is packed **/
+typedef struct
+{
+    uint32_t marker;            /**< Marker which helps identify this packet as an update amnanger data packet **/
+    uint32_t sequence_number;   /**< sequence number to keep packet ordering correct **/
+    uint32_t chunk_size_bytes;  /**< size of the image binary contained within this packet **/
+    uint8_t* image_chunk;       /**< The binary image data of this packet **/
+}__attribute__((packed)) update_data_t;
+
 
 /***********************
  * Private Variables
  ***********************/
+
+//UDP socket variables
 struct udp_pcb* pcb;
 ip_addr_t update_manager_addr;
 struct pbuf packet_buffer;
 
+//
+uint8_t _buffer[_BUFFER_LENGTH];
 
-uint8_t _rx_buffer[_RX_BUFFER_LENGTH];
+//variables for image update process
 uint32_t _last_sequence_number = 0;
 uint32_t _image_size_bytes = 0;
 uint32_t _num_update_packets = 0;
-
 bool _received_metadata = false;
-
-esp_partition_t* _partition_to_load;
+const esp_partition_t* _partition_to_load;
 esp_ota_handle_t _ota_handle;
 
-bool _update_complete = false;
-
-//first packet we get from server on update, giving important meta data about the new image
-typedef struct
-{
-    uint32_t marker;
-    uint32_t sequence_number;  //THIS SHOULD ALWAYS BE 0 FOR UPDATE METADATA
-    uint32_t image_size_bytes;
-    uint32_t num_packets;
-    uint32_t image_checksum;
-}__attribute__((packed)) update_metadata_t;
-
-//all image data will come in these packets
-typedef struct
-{
-    uint32_t marker;
-    uint32_t sequence_number;
-    uint32_t chunk_size_bytes;
-    uint8_t* image_chunk;
-}__attribute__((packed)) update_data_t;
+//update manager private options
+update_manager_options_t _options = _UPDATE_MANAGER_DEFAULT_OPTIONS;
+update_manager_state_t _state = UPDATE_MANAGER_STATE__IDLE;
 
 //This loop is entered when the device receives an update begin packet from the server.
 //loop handles all tx/rx traffic, updating, setting new partition, restarting, etc.
@@ -80,11 +96,15 @@ void UpdateManager_RxCallback(void* arg, struct udp_pcb* upcb, struct pbuf* p, c
 
     if(memcmp(_UPDATE_METADATA_MARKER, buffer, 4) == 0)
     {
+        //update the internal state of update manager
+        _state = UPDATE_MANAGER_STATE__UPDATING;
         //printf("found marker in update packet");
         if(_received_metadata)
         {
             //we already received meta data once, so there was an error somewhere and this is restarting the process
             esp_ota_end(_ota_handle);  //end previous op
+            //reset the last sequence number
+            _last_sequence_number = 0;
         }
         //we need to get metadata
         update_metadata_t* metadata = (update_metadata_t*)buffer;
@@ -97,7 +117,7 @@ void UpdateManager_RxCallback(void* arg, struct udp_pcb* upcb, struct pbuf* p, c
             printf("\r\nNum update packets required: %d\r\n", _num_update_packets);
 
 
-            esp_partition_t* current_boot_partition = esp_ota_get_boot_partition();//esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, _PARTITION1);//esp_ota_get_boot_partition();
+            const esp_partition_t* current_boot_partition = esp_ota_get_boot_partition();//esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, _PARTITION1);//esp_ota_get_boot_partition();
             if(current_boot_partition)
             {
                 printf("\r\ncurrent boot partition name: %s\r\n", current_boot_partition->label);
@@ -128,7 +148,7 @@ void UpdateManager_RxCallback(void* arg, struct udp_pcb* upcb, struct pbuf* p, c
                 }
                 else
                 {
-                    _partition_to_load = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, _PARTITION1);
+                    _partition_to_load = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, (const char*)_PARTITION1);
                     esp_err_t load_result = esp_ota_begin(_partition_to_load, 0, &_ota_handle);
                     if(load_result != ESP_OK)
                     {
@@ -161,35 +181,33 @@ void UpdateManager_RxCallback(void* arg, struct udp_pcb* upcb, struct pbuf* p, c
             ok = true;
             if(update_data->sequence_number == _last_sequence_number+1)
             {
+                _last_sequence_number++;
                 uint8_t* new_image_data = (uint8_t*)((uint32_t)&(update_data->image_chunk));
                 esp_err_t write_res = esp_ota_write(_ota_handle, new_image_data, update_data->chunk_size_bytes);
                 if(write_res != ESP_OK)
                 {
                     printf("\r\nesp ota write failed. Reason: %d\r\n", write_res);
+                    ok=false; //bad write, error the update
                 }
-                _last_sequence_number++;
+                
                 if(_last_sequence_number == _num_update_packets)
                 {
-                    printf("\r\nGOT LAST UPDATE PACKET!\r\n");
-                    printf("\r\nDoing nothing....\r\n");
                     esp_ota_end(_ota_handle);
-                    _update_complete = true;
-
-                    esp_err_t espError = esp_ota_set_boot_partition(_partition_to_load);
-                    if(espError != ESP_OK)
-                    {
-                        printf("\r\nEsp ota set boot partition failed. reason: %d\r\n", espError);
-                    }
-                    else
-                    {
-                        esp_restart();
-                    }
+                    _state = UPDATE_MANAGER_STATE__NEW_IMAGE_READY;
                 }
             }
             else
             {
                 //request previous seq number
-                printf("\r\nWARM: got out of order sequence number packet, ignored but acked");
+                if(update_data->sequence_number <= _last_sequence_number)
+                {
+                    printf("\r\nWARM: got old sequence number packet, ignored but acked");
+                }
+                else
+                {
+                    printf("\r\nERROR: got future sequence number packet, ignored and errored");
+                    ok = false;   
+                }
             }
         }
         else
@@ -200,18 +218,19 @@ void UpdateManager_RxCallback(void* arg, struct udp_pcb* upcb, struct pbuf* p, c
 
     if(ok)
     {
-        memcpy(_rx_buffer, "OK", 2);
-        packet_buffer.payload = _rx_buffer;
-        packet_buffer.len = 2;
-        packet_buffer.tot_len = 2;
+        memcpy(_buffer, "OK", 2);
+        memcpy(&_buffer[2], &_last_sequence_number, 4);  //add 4 byte seq num that we are ok-ing to this packet for python server to check
+        packet_buffer.payload = _buffer;
+        packet_buffer.len = 6;
+        packet_buffer.tot_len = 6;
         packet_buffer.type = PBUF_RAM;
         packet_buffer.ref = 1;
         udp_sendto(upcb, &packet_buffer, remote_addr, port);
     }
     else
     {
-        memcpy(_rx_buffer, "ERROR", 5);
-        packet_buffer.payload = _rx_buffer;
+        memcpy(_buffer, "ERROR", 5);
+        packet_buffer.payload = _buffer;
         packet_buffer.len = 5;
         packet_buffer.tot_len = 5;
         packet_buffer.type = PBUF_RAM;
@@ -220,54 +239,87 @@ void UpdateManager_RxCallback(void* arg, struct udp_pcb* upcb, struct pbuf* p, c
     }
 
     pbuf_free(p);
+
+    //auto restart needs to start after the final response has been sent otherwise loader app doesn't get last ok
+    if(_state == UPDATE_MANAGER_STATE__NEW_IMAGE_READY && _options.auto_restart)
+    {
+        //auto restart, check for restart delay and handle
+        if(_options.restart_delay_ms != 0)
+        {
+            vTaskDelay(_options.restart_delay_ms / portTICK_RATE_MS);
+        }
+        //we have to check that the auto_restart flag is still set here in case an app has cancelled the
+        //auto restart during the restart_delay period or through callback for some reason.  
+        if(_options.auto_restart)
+        {
+            //switching the boot partition can not occur until inside this final check for auto_restart to
+            //detect cancellation which has the desired behavior of maintining the current boot partition for whatever reason
+            if(UpdateManager_SelectNewBootPartition())
+            {
+                if(UpdateManager_InitiateRestart())
+                {
+
+                }
+                else
+                {
+                    printf("\r\nRestart failed due to cancellation\r\n");
+                }
+            }
+            else
+            {
+                printf("\r\nEsp ota set boot partition failed\r\n");
+            }
+        }
+    }
+
 }
 
-bool UpdateManager_Create(void)
+bool UpdateManager_Create(update_manager_options_t* options)
 {
     pcb = udp_new();
     update_manager_addr.u_addr.ip4.addr = htonl(INADDR_ANY);
-    udp_bind(pcb, &update_manager_addr, _UPDATE_MANAGER_PORT);
+
+    if(options != NULL)
+    {
+        _options = *options;
+    }
+
+    udp_bind(pcb, &update_manager_addr, _options.udp_port);
 
     udp_recv(pcb, UpdateManager_RxCallback, NULL);
 
     return true;
 }
 
-bool UpdateManager_GetUpdateComplete(void)
+update_manager_state_t UpdateManager_GetState(void)
 {
-    return _update_complete;
+    return _state;
 }
 
-esp_partition_t* UpdateManager_GetNewPartition(void)
+const esp_partition_t* UpdateManager_GetNewPartition(void)
 {
     return _partition_to_load;
 }
 
-//======================================================
-//BELOW IS LOWER LAYER UDP/MULTICAST STUFF
-// struct udp_pcb* pcb;
-// ip_addr_t multicast_addr;
-// struct pbuf packet_buffer;
+bool UpdateManager_SelectNewBootPartition(void)
+{
+    if(_state == UPDATE_MANAGER_STATE__NEW_IMAGE_READY)
+    {
+        esp_err_t espError = esp_ota_set_boot_partition(_partition_to_load);
+        if(espError == ESP_OK)
+        {
+            _state = UPDATE_MANAGER_STATE__NEW_IMAGE_SELECTED;
+            return true;  //we successfully set the new boot partition
+        }
+    }
+    return false; //error
+}
 
-//void udp_multicast_init()
-//{
-//  pcb = udp_new();
-//  multicast_addr.u_addr.ip4.addr = inet_addr(BROADCAST_GROUP_ADDR);
-//  udp_connect(pcb, &multicast_addr, BROADCAST_PORT);
-//}
-
-//void udp_broadcast(uint16_t port, uint8_t* buffer, uint16_t buffer_length)
-//{
-    // packet_buffer.next = NULL;
-    // packet_buffer.payload = buffer;
-    // packet_buffer.len = buffer_length;
-    // packet_buffer.tot_len = buffer_length;
-    // packet_buffer.flags = 0;
-    // packet_buffer.ref = 1;
-    // packet_buffer.type = PBUF_RAM;
-    // err_t res = udp_send(pcb, &packet_buffer);
-    // if(res < 0)
-    // {
-    //  Pin_SetOutput(DEBUG_PIN3_MASK);
-    // }
-//}
+bool UpdateManager_InitiateRestart(void)
+{
+    if(_state == UPDATE_MANAGER_STATE__NEW_IMAGE_SELECTED)
+    {
+        esp_restart();
+    }
+    return false; //false return value is only in case of failure since success the caller won't see a return because of restart
+}
