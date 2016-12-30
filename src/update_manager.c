@@ -30,8 +30,7 @@
     .restart_delay_ms = _UPDATE_MANAGER_DEFAULT__RESTART_DELAY_MS \
 }
 
-#define _UPDATE_METADATA_MARKER "UPDM"
-#define _UPDATE_DATA_MARKER "UPDD"
+#define _UPDATE_MANAGER_PACKET_MARKER "UPD8"
 
 #define _PARTITION1 "ota_0"
 #define _PARTITION2 "ota_1"
@@ -39,11 +38,26 @@
 /***********************
  * Private Types
  ***********************/
+/** @brief update manager packet types**/
+typedef enum
+{
+    UPDATE_PACKET_TYPE__METADATA,
+    UPDATE_PACKET_TYPE__IMAGE_DATA,
+}update_packet_type_t;
+
+/** @brief structure for an update packet header.  This is packed **/
+typedef struct
+{
+    uint32_t marker;            /**< Marker which helps identify this packet as an update manager packet **/
+    uint32_t sequence_number;   /**< Sequence number for this packet.  For image metadata, this should always be 0 **/
+    uint32_t packet_type;       /**< Specifies the type of this packet **/
+    uint32_t payload_length;    /**< Length of the payload for this packet **/
+    uint8_t* payload;           /**< Payload data **/
+}__attribute__((packed)) update_header_t;
+
 /** @brief structure for an update metadata packet.  This is packed **/
 typedef struct
 {
-    uint32_t marker;            /**< Marker which helps identify this packet as an update manager metadata packet **/
-    uint32_t sequence_number;   /**< Sequence number for this packet.  For image metadata, this should always be 0 **/
     uint32_t image_size_bytes;  /**< Image size in bytes. **/
     uint32_t num_packets;       /**< number of packets to expect over the course of the update process **/
     uint32_t image_checksum;    /**< checksum of the entire image **/
@@ -52,12 +66,9 @@ typedef struct
 /** @brief structure for an update data packet.  Contains new image binary data.  This is packed **/
 typedef struct
 {
-    uint32_t marker;            /**< Marker which helps identify this packet as an update amnanger data packet **/
-    uint32_t sequence_number;   /**< sequence number to keep packet ordering correct **/
     uint32_t chunk_size_bytes;  /**< size of the image binary contained within this packet **/
     uint8_t* image_chunk;       /**< The binary image data of this packet **/
-}__attribute__((packed)) update_data_t;
-
+}__attribute__((packed)) update_image_data_t;
 
 /***********************
  * Private Variables
@@ -94,125 +105,134 @@ void UpdateManager_RxCallback(void* arg, struct udp_pcb* upcb, struct pbuf* p, c
     uint8_t* buffer = (uint8_t*)p->payload;
     bool ok = false;
 
-    if(memcmp(_UPDATE_METADATA_MARKER, buffer, 4) == 0)
+    if(memcmp(_UPDATE_MANAGER_PACKET_MARKER, buffer, 4) == 0)
     {
-        //update the internal state of update manager
-        _state = UPDATE_MANAGER_STATE__UPDATING;
-        //printf("found marker in update packet");
-        if(_received_metadata)
+        //parse the header
+        update_header_t* header = (update_header_t*)buffer;
+        if(header->packet_type == UPDATE_PACKET_TYPE__METADATA)
         {
-            //we already received meta data once, so there was an error somewhere and this is restarting the process
-            esp_ota_end(_ota_handle);  //end previous op
-            //reset the last sequence number
-            _last_sequence_number = 0;
-        }
-        //we need to get metadata
-        update_metadata_t* metadata = (update_metadata_t*)buffer;
-        if(metadata->sequence_number == 0)
-        {
-            _image_size_bytes = metadata->image_size_bytes;
-            _num_update_packets = metadata->num_packets;
-
-            printf("\r\nNew image size in bytes: %d\r\n", _image_size_bytes);
-            printf("\r\nNum update packets required: %d\r\n", _num_update_packets);
-
-
-            const esp_partition_t* current_boot_partition = esp_ota_get_boot_partition();//esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, _PARTITION1);//esp_ota_get_boot_partition();
-            if(current_boot_partition)
+            update_metadata_t* metadata = (update_metadata_t*)(&header->payload);
+            //update the internal state of update manager
+            _state = UPDATE_MANAGER_STATE__UPDATING;
+            //printf("found marker in update packet");
+            if(_received_metadata)
             {
-                printf("\r\ncurrent boot partition name: %s\r\n", current_boot_partition->label);
-                printf("\r\ncurrent boot partition address: %d\r\n", current_boot_partition->address);
-                
-                if(memcmp(current_boot_partition->label, _PARTITION1, sizeof(_PARTITION1)) == 0)
+                //we already received meta data once, so there was an error somewhere and this is restarting the process
+                esp_ota_end(_ota_handle);  //end previous op
+                //reset the last sequence number
+                _last_sequence_number = 0;
+            }
+            if(header->sequence_number == 0)
+            {
+                _image_size_bytes = metadata->image_size_bytes;
+                _num_update_packets = metadata->num_packets;
+
+                printf("\r\nNew image size in bytes: %d\r\n", _image_size_bytes);
+                printf("\r\nNum update packets required: %d\r\n", _num_update_packets);
+
+
+                const esp_partition_t* current_boot_partition = esp_ota_get_boot_partition();//esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, _PARTITION1);//esp_ota_get_boot_partition();
+                if(current_boot_partition)
                 {
-                    //load to partition2
-                    _partition_to_load = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, _PARTITION2);
-                    esp_err_t load_result = esp_ota_begin(_partition_to_load, 0, &_ota_handle);
-                    if(load_result != ESP_OK)
+                    printf("\r\ncurrent boot partition name: %s\r\n", current_boot_partition->label);
+                    printf("\r\ncurrent boot partition address: %d\r\n", current_boot_partition->address);
+                    
+                    if(memcmp(current_boot_partition->label, _PARTITION1, sizeof(_PARTITION1)) == 0)
                     {
-                        printf("\r\n couldn't load partition 2, reason: %d", load_result);
-                        if(_partition_to_load)
+                        //load to partition2
+                        _partition_to_load = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, _PARTITION2);
+                        esp_err_t load_result = esp_ota_begin(_partition_to_load, 0, &_ota_handle);
+                        if(load_result != ESP_OK)
                         {
-                            printf("\r\npart size: %d\r\n", _partition_to_load->size);
+                            printf("\r\n couldn't load partition 2, reason: %d", load_result);
+                            if(_partition_to_load)
+                            {
+                                printf("\r\npart size: %d\r\n", _partition_to_load->size);
+                            }
+                            ok = false;
                         }
-                        ok = false;
+                        else
+                        {
+                            printf("\r\nloading to partition name: %s\r\n", _partition_to_load->label);
+                            printf("\r\nloading to partition address: %d\r\n", _partition_to_load->address);
+
+                            _received_metadata = true;
+                            ok = true;
+                        }
                     }
                     else
                     {
-                        printf("\r\nloading to partition name: %s\r\n", _partition_to_load->label);
-                        printf("\r\nloading to partition address: %d\r\n", _partition_to_load->address);
+                        _partition_to_load = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, (const char*)_PARTITION1);
+                        esp_err_t load_result = esp_ota_begin(_partition_to_load, 0, &_ota_handle);
+                        if(load_result != ESP_OK)
+                        {
+                            printf("\r\n couldn't load partition 1, reason: %d", load_result);
+                            ok = false;
+                        }
+                        else
+                        {
+                            printf("\r\nloading to partition name: %s\r\n", _partition_to_load->label);
+                            printf("\r\nloading to partition address: %d\r\n", _partition_to_load->address);
 
-                        _received_metadata = true;
-                        ok = true;
+                            _received_metadata = true;
+                            ok = true;
+                        }
                     }
                 }
                 else
                 {
-                    _partition_to_load = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, (const char*)_PARTITION1);
-                    esp_err_t load_result = esp_ota_begin(_partition_to_load, 0, &_ota_handle);
-                    if(load_result != ESP_OK)
-                    {
-                        printf("\r\n couldn't load partition 1, reason: %d", load_result);
-                        ok = false;
-                    }
-                    else
-                    {
-                        printf("\r\nloading to partition name: %s\r\n", _partition_to_load->label);
-                        printf("\r\nloading to partition address: %d\r\n", _partition_to_load->address);
-
-                        _received_metadata = true;
-                        ok = true;
-                    }
+                    printf("\r\nError: couldn't get current boot partition\r\n");
+                    ok = false;
                 }
-            }
-            else
-            {
-                printf("\r\nError: couldn't get current boot partition\r\n");
-                ok = false;
             }
         }
-    }
-    else if(memcmp(_UPDATE_DATA_MARKER, buffer, 4) == 0)
-    {
-        //this should be an image packet so sequence number should be non zero
-        update_data_t* update_data = (update_data_t*)buffer;
-        if(update_data->sequence_number > 0)
+        else if(header->packet_type == UPDATE_PACKET_TYPE__IMAGE_DATA)
         {
-            ok = true;
-            if(update_data->sequence_number == _last_sequence_number+1)
+            update_image_data_t* image_data = (update_image_data_t*) (&header->payload);
+            if(header->sequence_number > 0)
             {
-                _last_sequence_number++;
-                uint8_t* new_image_data = (uint8_t*)((uint32_t)&(update_data->image_chunk));
-                esp_err_t write_res = esp_ota_write(_ota_handle, new_image_data, update_data->chunk_size_bytes);
-                if(write_res != ESP_OK)
+                ok = true;
+                if(header->sequence_number == _last_sequence_number+1)
                 {
-                    printf("\r\nesp ota write failed. Reason: %d\r\n", write_res);
-                    ok=false; //bad write, error the update
+                    _last_sequence_number++;
+                    uint8_t* new_image_data = (uint8_t*)((uint32_t)&(image_data->image_chunk));
+                    esp_err_t write_res = esp_ota_write(_ota_handle, new_image_data, image_data->chunk_size_bytes);
+                    if(write_res != ESP_OK)
+                    {
+                        printf("\r\nesp ota write failed. Reason: %d\r\n", write_res);
+                        ok=false; //bad write, error the update
+                    }
+                    
+                    if(_last_sequence_number == _num_update_packets)
+                    {
+                        esp_ota_end(_ota_handle);
+                        _state = UPDATE_MANAGER_STATE__NEW_IMAGE_READY;
+                    }
                 }
-                
-                if(_last_sequence_number == _num_update_packets)
+                else
                 {
-                    esp_ota_end(_ota_handle);
-                    _state = UPDATE_MANAGER_STATE__NEW_IMAGE_READY;
+                    //header had previous seq number
+                    if(header->sequence_number <= _last_sequence_number)
+                    {
+                        printf("\r\nWARM: got old sequence number packet, ignored but acked");
+                    }
+                    else
+                    {
+                        printf("\r\nERROR: got future sequence number packet, ignored and errored");
+                        ok = false;   
+                    }
                 }
             }
             else
             {
-                //request previous seq number
-                if(update_data->sequence_number <= _last_sequence_number)
-                {
-                    printf("\r\nWARM: got old sequence number packet, ignored but acked");
-                }
-                else
-                {
-                    printf("\r\nERROR: got future sequence number packet, ignored and errored");
-                    ok = false;   
-                }
+                ok = false;
             }
         }
         else
         {
-            ok = false;
+            //not an update manager packet, no marker
+            pbuf_free(p);
+            return;
         }
     }
 
