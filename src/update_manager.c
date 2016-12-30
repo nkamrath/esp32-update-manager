@@ -75,24 +75,24 @@ typedef struct
  ***********************/
 
 //UDP socket variables
-struct udp_pcb* pcb;
-ip_addr_t update_manager_addr;
-struct pbuf packet_buffer;
+static struct udp_pcb* pcb;
+static ip_addr_t update_manager_addr;
+static struct pbuf packet_buffer;
 
 //
-uint8_t _buffer[_BUFFER_LENGTH];
+static uint8_t _buffer[_BUFFER_LENGTH];
 
 //variables for image update process
-uint32_t _last_sequence_number = 0;
-uint32_t _image_size_bytes = 0;
-uint32_t _num_update_packets = 0;
-bool _received_metadata = false;
-const esp_partition_t* _partition_to_load;
-esp_ota_handle_t _ota_handle;
+static uint32_t _last_sequence_number = 0;
+static uint32_t _image_size_bytes = 0;
+static uint32_t _num_update_packets = 0;
+static bool _received_metadata = false;
+static const esp_partition_t* _partition_to_load;
+static esp_ota_handle_t _ota_handle;
 
 //update manager private options
-update_manager_options_t _options = _UPDATE_MANAGER_DEFAULT_OPTIONS;
-update_manager_state_t _state = UPDATE_MANAGER_STATE__IDLE;
+static update_manager_options_t _options = _UPDATE_MANAGER_DEFAULT_OPTIONS;
+static update_manager_state_t _state = UPDATE_MANAGER_STATE__IDLE;
 
 //This loop is entered when the device receives an update begin packet from the server.
 //loop handles all tx/rx traffic, updating, setting new partition, restarting, etc.
