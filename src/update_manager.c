@@ -10,8 +10,6 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 
-#include "pin.h"
-
 #include <string.h>
 #include <stdint.h>
 
